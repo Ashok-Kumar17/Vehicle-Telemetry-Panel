@@ -1,4 +1,7 @@
 # CAN Telemetry Dashboard
+![Python](https://img.shields.io/badge/Python-3776AB?style=flat&logo=python&logoColor=white)
+![FastAPI](https://img.shields.io/badge/FastAPI-009688?style=flat&logo=fastapi&logoColor=white)
+![WebSocket](https://img.shields.io/badge/WebSockets-black?style=flat&logo=websocket&logoColor=white)
 
 A real-time CAN bus telemetry server: replays a CAN log at (a multiple of)
 real speed, decodes signals against a DBC as they "arrive," and streams them
