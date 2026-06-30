@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>CAN Telemetry Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --border: #30363d;
+    --text: #c9d1d9;
+    --accent: #58a6ff;
+    --danger: #f85149;
+    --ok: #3fb950;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  header {
+    padding: 16px 24px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+  h1 { font-size: 18px; margin: 0; font-weight: 600; }
+  .controls { display: flex; align-items: center; gap: 10px; font-size: 13px; }
+  select, button {
+    background: var(--panel);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+  .status-dot {
+    width: 9px; height: 9px; border-radius: 50%;
+    background: var(--danger); display: inline-block; margin-right: 6px;
+  }
+  .status-dot.connected { background: var(--ok); }
+  #fault-banner {
+    display: none;
+    background: rgba(248, 81, 73, 0.15);
+    border: 1px solid var(--danger);
+    color: var(--danger);
+    padding: 10px 24px;
+    font-size: 14px;
+    font-weight: 600;
+  }
+  main {
+    padding: 20px 24px;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
+    gap: 18px;
+  }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px;
+  }
+  .panel h2 {
+    font-size: 13px;
+    margin: 0 0 8px 0;
+    color: #8b949e;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  canvas { max-height: 220px; }
+  .latest-value {
+    font-size: 12px;
+    color: #8b949e;
+    margin-top: 6px;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>🚗 CAN Telemetry Dashboard</h1>
+  <div class="controls">
+    <span><span id="status-dot" class="status-dot"></span><span id="status-text">disconnected</span></span>
+    <label>Replay speed:
+      <select id="speed-select">
+        <option value="1">1x (real time)</option>
+        <option value="5">5x</option>
+        <option value="20" selected>20x</option>
+        <option value="100">100x</option>
+      </select>
+    </label>
+    <button id="start-btn">Start Replay</button>
+  </div>
+</header>
+
+<div id="fault-banner"></div>
+
+<main id="charts-container"></main>
+
+<script>
+const CHART_WINDOW_SECONDS = 30; // rolling window so the chart doesn't grow unbounded
+const charts = {};   // signal name -> Chart.js instance
+const seriesBuffers = {}; // signal name -> {t: [], v: []}
+
+// Group signals into panels by message, so related signals share a chart
+const PANEL_GROUPS = {
+  "Motor & Controller Temp": ["MotorTemp", "ControllerTemp"],
+  "Motor RPM / Current": ["MotorRPM", "MotorCurrent"],
+  "Torque": ["TorqueCommand", "TorqueActual", "ThrottlePosition"],
+  "BMS Pack": ["PackVoltage", "PackCurrent", "PackSOC"],
+};
+
+const PALETTE = ["#58a6ff", "#f85149", "#3fb950", "#d29922", "#bc8cff"];
+
+function buildPanels() {
+  const container = document.getElementById("charts-container");
+  Object.entries(PANEL_GROUPS).forEach(([title, signalNames]) => {
+    const panel = document.createElement("div");
+    panel.className = "panel";
+    panel.innerHTML = `<h2>${title}</h2><canvas></canvas><div class="latest-value" id="latest-${title}"></div>`;
+    container.appendChild(panel);
+
+    const ctx = panel.querySelector("canvas").getContext("2d");
+    const datasets = signalNames.map((name, i) => ({
+      label: name,
+      data: [],
+      borderColor: PALETTE[i % PALETTE.length],
+      backgroundColor: "transparent",
+      borderWidth: 1.5,
+      pointRadius: 0,
+      tension: 0.15,
+    }));
+
+    const chart = new Chart(ctx, {
+      type: "line",
+      data: { datasets },
+      options: {
+        animation: false,
+        responsive: true,
+        maintainAspectRatio: false,
+        scales: {
+          x: { type: "linear", title: { display: true, text: "time (s)", color: "#8b949e" }, ticks: { color: "#8b949e" }, grid: { color: "#21262d" } },
+          y: { ticks: { color: "#8b949e" }, grid: { color: "#21262d" } },
+        },
+        plugins: { legend: { labels: { color: "#c9d1d9", font: { size: 11 } } } },
+      },
+    });
+
+    signalNames.forEach((name) => { charts[name] = { chart, datasetIndex: signalNames.indexOf(name), panelTitle: title }; });
+  });
+}
+
+function pushSignal(name, t, v) {
+  const entry = charts[name];
+  if (!entry) return; // signal not in any panel -- ignore (e.g. MotorState is text, not charted)
+  const ds = entry.chart.data.datasets[entry.datasetIndex];
+  ds.data.push({ x: t, y: v });
+  while (ds.data.length && t - ds.data[0].x > CHART_WINDOW_SECONDS) ds.data.shift();
+  entry.chart.options.scales.x.min = Math.max(0, t - CHART_WINDOW_SECONDS);
+  entry.chart.options.scales.x.max = t;
+  entry.chart.update("none");
+
+  const latestEl = document.getElementById(`latest-${entry.panelTitle}`);
+  if (latestEl) {
+    const parts = entry.chart.data.datasets.map((d) => {
+      const last = d.data[d.data.length - 1];
+      return last ? `${d.label}: ${last.y.toFixed(1)}` : null;
+    }).filter(Boolean);
+    latestEl.textContent = parts.join("   |   ");
+  }
+}
+
+function showFault(event) {
+  const banner = document.getElementById("fault-banner");
+  const code = event.signals.DTC_Code;
+  const source = event.signals.DTC_Source;
+  banner.textContent = `⚠ FAULT at t=${event.t}s -- ${code} (source: ${source})`;
+  banner.style.display = "block";
+}
+
+function connect(speed) {
+  const statusDot = document.getElementById("status-dot");
+  const statusText = document.getElementById("status-text");
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const ws = new WebSocket(`${proto}://${location.host}/ws?speed=${speed}`);
+
+  ws.onopen = () => { statusDot.classList.add("connected"); statusText.textContent = "streaming"; };
+  ws.onclose = () => { statusDot.classList.remove("connected"); statusText.textContent = "disconnected"; };
+  ws.onerror = () => { statusText.textContent = "error"; };
+
+  ws.onmessage = (msg) => {
+    const event = JSON.parse(msg.data);
+    if (event.type === "signal") {
+      Object.entries(event.signals).forEach(([name, value]) => {
+        if (typeof value === "number") pushSignal(name, event.t, value);
+      });
+    } else if (event.type === "fault") {
+      showFault(event);
+    } else if (event.type === "end_of_log") {
+      statusText.textContent = "replay finished";
+    }
+  };
+}
+
+buildPanels();
+document.getElementById("start-btn").addEventListener("click", () => {
+  const speed = document.getElementById("speed-select").value;
+  document.getElementById("fault-banner").style.display = "none";
+  // Clear all chart datasets before restarting (charts object has one entry
+  // per signal, but several signals share the same chart instance -- dedupe
+  // via Set so we don't clear+redraw the same chart multiple times).
+  const seen = new Set();
+  Object.values(charts).forEach(({ chart }) => {
+    if (seen.has(chart)) return;
+    seen.add(chart);
+    chart.data.datasets.forEach((d) => (d.data = []));
+    chart.update();
+  });
+  connect(speed);
+});
+</script>
+</body>
+</html>
